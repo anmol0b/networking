@@ -231,6 +231,7 @@ fn test_gbn_sender_window_boundary() {
     use tcp_over_udp::gbn_sender::GbnSender;
 
     let mut s = GbnSender::new(0, 3);
+    s.cwnd = 3; // bypass congestion window so window_size governs
 
     // Fill the window.
     for _ in 0..3u32 {
@@ -399,6 +400,7 @@ fn test_karn_retransmit_no_sample() {
     use tcp_over_udp::gbn_sender::GbnSender;
 
     let mut s = GbnSender::new(0, 2);
+    s.cwnd = 2; // bypass congestion window so both segments can be sent
 
     // Send two segments.
     let p1 = s.build_data_packet(vec![1u8; 8], 0, 8192);
@@ -600,6 +602,136 @@ fn test_cwnd_fast_recovery_exit_on_new_ack() {
 
     assert_eq!(s.cwnd(), 4, "exit FR: cwnd ← ssthresh = 4");
     assert_eq!(*s.cc_state(), CongestionState::CongestionAvoidance);
+}
+
+// ---------------------------------------------------------------------------
+// Test 17: < 3 duplicate ACKs (reordering) must NOT trigger fast recovery
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_reordered_ack_below_threshold_no_fast_retransmit() {
+    use tcp_over_udp::gbn_sender::{CongestionState, GbnSender};
+
+    let mut s = GbnSender::new(0, 8);
+    s.cwnd = 4;
+
+    // Put 4 segments in flight (4-byte payloads → seq 0, 4, 8, 12).
+    for _ in 0..4 {
+        let p = s.build_data_packet(vec![0u8; 4], 0, 8192);
+        s.record_sent(p);
+    }
+    assert_eq!(s.in_flight(), 4);
+
+    // 2 duplicate ACKs — could be mere reordering; must not enter FR.
+    let r1 = s.on_ack(s.send_base);
+    assert!(r1.dup_ack, "first dup-ACK must be flagged");
+    let r2 = s.on_ack(s.send_base);
+    assert!(r2.dup_ack, "second dup-ACK must be flagged");
+    assert_eq!(s.dup_ack_count(), 2);
+    assert_ne!(
+        *s.cc_state(),
+        CongestionState::FastRecovery,
+        "2 dup-ACKs must not enter fast recovery (reordering threshold is 3)"
+    );
+
+    // Reordering resolves: new ACK advances the window by 2 segments.
+    let r3 = s.on_ack(8);
+    assert_eq!(r3.acked_count, 2, "new ACK must ack 2 segments");
+    assert_eq!(s.dup_ack_count(), 0, "new ACK must reset dup_ack_count");
+    assert_ne!(
+        *s.cc_state(),
+        CongestionState::FastRecovery,
+        "cwnd must not enter fast recovery once reordering resolves"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 18: fast retransmit keeps cwnd > 1, unlike timeout which resets to 1
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fast_retransmit_cwnd_above_one_unlike_timeout() {
+    use tcp_over_udp::gbn_sender::{CongestionState, GbnSender};
+
+    // ── Fast retransmit path ──────────────────────────────────────────────
+    let mut s_fr = GbnSender::new(0, 8);
+    s_fr.cwnd = 4;
+    for _ in 0..4 {
+        let p = s_fr.build_data_packet(vec![0u8; 4], 0, 8192);
+        s_fr.record_sent(p);
+    }
+    for _ in 0..3 {
+        s_fr.on_ack(s_fr.send_base);
+    }
+    s_fr.on_triple_dup_ack_cc();
+
+    assert_eq!(*s_fr.cc_state(), CongestionState::FastRecovery);
+    assert_ne!(
+        s_fr.cwnd(), 1,
+        "fast retransmit must NOT collapse cwnd to 1 — only a timeout does that"
+    );
+    let fr_cwnd = s_fr.cwnd(); // ssthresh+3 = 2+3 = 5
+
+    // ── Timeout path — same initial conditions ────────────────────────────
+    let mut s_to = GbnSender::new(0, 8);
+    s_to.cwnd = 4;
+    for _ in 0..4 {
+        let p = s_to.build_data_packet(vec![0u8; 4], 0, 8192);
+        s_to.record_sent(p);
+    }
+    s_to.on_timeout_cc();
+
+    assert_eq!(s_to.cwnd(), 1, "timeout must reset cwnd to 1");
+    assert_eq!(*s_to.cc_state(), CongestionState::SlowStart);
+
+    assert!(
+        fr_cwnd > s_to.cwnd(),
+        "FR cwnd ({fr_cwnd}) must exceed timeout cwnd (1): fast retransmit preserves throughput"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 19: full fast recovery cycle driven end-to-end via on_ack()
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fast_recovery_full_cycle_via_on_ack() {
+    use tcp_over_udp::gbn_sender::{CongestionState, GbnSender};
+
+    let mut s = GbnSender::new(0, 16);
+    s.cwnd = 4;
+
+    // 4 segments in flight (seq 0, 4, 8, 12).
+    for _ in 0..4 {
+        let p = s.build_data_packet(vec![0u8; 4], 0, 8192);
+        s.record_sent(p);
+    }
+    assert_eq!(s.in_flight(), 4);
+
+    // Three consecutive dup-ACKs via the real on_ack() path
+    // (simulates segments 1–3 arriving but segment 0 being lost).
+    let base = s.send_base;
+    for i in 1..=3u32 {
+        let r = s.on_ack(base);
+        assert!(r.dup_ack, "ACK #{i} must be a duplicate");
+        assert_eq!(s.dup_ack_count(), i);
+    }
+
+    // Enter fast recovery on the 3rd dup-ACK.
+    s.on_triple_dup_ack_cc();
+    let fr_ssthresh = s.ssthresh();
+    assert_eq!(fr_ssthresh, 2, "ssthresh = max(2, 4/2) = 2");
+    assert_eq!(s.cwnd(), fr_ssthresh + 3, "cwnd = ssthresh + 3 in fast recovery");
+    assert_eq!(*s.cc_state(), CongestionState::FastRecovery);
+
+    // A new (non-duplicate) ACK exits fast recovery → congestion avoidance.
+    s.on_ack_cc(1);
+    assert_eq!(s.cwnd(), fr_ssthresh, "FR→CA: cwnd must collapse to ssthresh");
+    assert_eq!(
+        *s.cc_state(),
+        CongestionState::CongestionAvoidance,
+        "must enter congestion avoidance after fast recovery exit"
+    );
 }
 
 // ---------------------------------------------------------------------------
