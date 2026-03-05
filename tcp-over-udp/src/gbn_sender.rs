@@ -39,10 +39,17 @@
 //! [`on_ack`]: GbnSender::on_ack
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::time::{Duration, Instant};
 
+use crate::congestion_control::{CongestionControl, LossKind, RenoCC};
 use crate::packet::{flags, Header, Packet};
 use crate::persist_timer::{PersistTimer, PersistTransition};
+
+// Re-export so existing code that imports from gbn_sender continues to compile.
+pub use crate::congestion_control::{
+    CongestionState, INITIAL_CWND, INITIAL_SSTHRESH,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -55,31 +62,6 @@ use crate::persist_timer::{PersistTimer, PersistTransition};
 #[inline]
 pub(crate) fn seq_le(a: u32, b: u32) -> bool {
     b.wrapping_sub(a) <= (u32::MAX / 2)
-}
-
-// ---------------------------------------------------------------------------
-// Congestion control constants
-// ---------------------------------------------------------------------------
-
-/// Initial congestion window: 1 segment (RFC 5681 §3.1).
-pub const INITIAL_CWND: usize = 1;
-
-/// Initial slow-start threshold: effectively unlimited until the first loss.
-pub const INITIAL_SSTHRESH: usize = 64;
-
-// ---------------------------------------------------------------------------
-// CongestionState
-// ---------------------------------------------------------------------------
-
-/// Current phase of the TCP Reno congestion control state machine.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CongestionState {
-    /// `cwnd` grows by 1 per newly-acked segment (exponential until `ssthresh`).
-    SlowStart,
-    /// `cwnd` grows by 1 per RTT (additive increase).
-    CongestionAvoidance,
-    /// Entered on 3 duplicate ACKs; exits to CA when a new ACK advances the window.
-    FastRecovery,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,7 +108,7 @@ pub struct GbnEntry {
 // GbnSender
 // ---------------------------------------------------------------------------
 
-/// Go-Back-N send-side state for one connection, with TCP Reno congestion control.
+/// Go-Back-N send-side state for one connection, with pluggable congestion control.
 ///
 /// # Sequence-number layout
 ///
@@ -144,9 +126,14 @@ pub struct GbnEntry {
 /// ```
 ///
 /// `window_size` is the maximum allowed (e.g. from the receiver's advertised
-/// window); `cwnd` is the congestion window managed by Reno.
-#[derive(Debug)]
-pub struct GbnSender {
+/// window); `cwnd` comes from the [`CongestionControl`] implementation.
+///
+/// The default congestion-control algorithm is [`RenoCC`] (TCP Reno).  To
+/// use a different algorithm, specify it as the type parameter:
+/// ```ignore
+/// let sender = GbnSender::<CubicCC>::new(seq, window_size);
+/// ```
+pub struct GbnSender<CC: CongestionControl = RenoCC> {
     /// Sequence number of the **oldest** unacked segment (left window edge).
     pub send_base: u32,
 
@@ -170,24 +157,20 @@ pub struct GbnSender {
     /// [`update_peer_rwnd`]: Self::update_peer_rwnd
     peer_rwnd: usize,
 
-    // ── Reno congestion control ──────────────────────────────────────────
+    // ── Congestion control ───────────────────────────────────────────────
 
-    /// Congestion window in segments (Reno-managed).
-    pub cwnd: usize,
-
-    /// Slow-start threshold in segments.
-    pub ssthresh: usize,
-
-    /// Current Reno phase.
-    pub cc_state: CongestionState,
+    /// Pluggable congestion-control algorithm.
+    ///
+    /// Exposes `cwnd()`, `on_ack()`, and `on_loss()`.  For TCP Reno the
+    /// concrete type is [`RenoCC`]; fields such as `ssthresh` and `cc_state`
+    /// are accessible directly via `sender.cc.ssthresh` / `sender.cc.cc_state`.
+    pub cc: CC,
 
     /// Consecutive duplicate ACK counter (resets on any new ACK).
-    dup_ack_count: u32,
-
-    /// Partial-increment accumulator for the congestion-avoidance phase.
-    /// Incremented by `acked_count` on every ACK; when it reaches `cwnd`,
-    /// `cwnd` is increased by 1 and the counter resets.
-    cwnd_ca_counter: usize,
+    ///
+    /// Kept on [`GbnSender`] (not inside `cc`) because counting duplicate
+    /// ACKs is a windowing concern shared by all CC algorithms.
+    pub dup_ack_count: u32,
 
     // ── Persist timer ────────────────────────────────────────────────────
 
@@ -233,8 +216,21 @@ pub struct GbnSender {
     nagle_enabled: bool,
 }
 
-impl GbnSender {
-    /// Create a new [`GbnSender`].
+impl<CC: CongestionControl + fmt::Debug> fmt::Debug for GbnSender<CC> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GbnSender")
+            .field("send_base", &self.send_base)
+            .field("next_seq", &self.next_seq)
+            .field("window_size", &self.window_size)
+            .field("peer_rwnd", &self.peer_rwnd)
+            .field("cc", &self.cc)
+            .field("dup_ack_count", &self.dup_ack_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GbnSender<RenoCC> {
+    /// Create a new [`GbnSender`] with the default TCP Reno congestion control.
     ///
     /// `seq_start` is the first data sequence number (typically `ISN + 1`).
     /// `window_size` is the maximum in-flight window N (≥ 1).
@@ -249,18 +245,17 @@ impl GbnSender {
             window_size,
             window: VecDeque::with_capacity(window_size),
             peer_rwnd: u16::MAX as usize,
-            cwnd: INITIAL_CWND,
-            ssthresh: INITIAL_SSTHRESH,
-            cc_state: CongestionState::SlowStart,
+            cc: RenoCC::new(window_size),
             dup_ack_count: 0,
-            cwnd_ca_counter: 0,
             persist: PersistTimer::new(),
             sr_retransmit_count: 0,
             nagle_buf: Vec::new(),
             nagle_enabled: false,
         }
     }
+}
 
+impl<CC: CongestionControl> GbnSender<CC> {
     // -----------------------------------------------------------------------
     // Window predicates
     // -----------------------------------------------------------------------
@@ -276,7 +271,7 @@ impl GbnSender {
     /// resume once the peer ACKs with a non-zero window (or after a
     /// zero-window probe triggers an updated ACK).
     pub fn can_send(&self) -> bool {
-        let effective = self.window_size.min(self.cwnd);
+        let effective = self.window_size.min(self.cc.cwnd());
         self.window.len() < effective && self.bytes_in_flight() < self.peer_rwnd
     }
 
@@ -335,7 +330,7 @@ impl GbnSender {
             self.can_send(),
             "record_sent on a full window ({}/{})",
             self.window.len(),
-            self.window_size.min(self.cwnd)
+            self.window_size.min(self.cc.cwnd())
         );
         let payload_len = packet.payload.len() as u32;
         self.window.push_back(GbnEntry {
@@ -429,44 +424,16 @@ impl GbnSender {
 
     /// Update the congestion window after `acked_count` new segments are ACKed.
     ///
-    /// Call this **after** [`on_ack`] returns a positive `acked_count`.
-    /// Implements the Reno growth rules for all three phases.
+    /// Delegates to [`CongestionControl::on_ack`].  Call this **after**
+    /// [`on_ack`] returns a positive `acked_count`.
     ///
     /// [`on_ack`]: Self::on_ack
     pub fn on_ack_cc(&mut self, acked_count: usize) {
-        match self.cc_state {
-            CongestionState::SlowStart => {
-                // Exponential growth: +1 segment per newly-acked segment.
-                self.cwnd = (self.cwnd + acked_count).min(self.window_size);
-                if self.cwnd >= self.ssthresh {
-                    self.cc_state = CongestionState::CongestionAvoidance;
-                    self.cwnd_ca_counter = 0;
-                    log::debug!("[cc] SS→CA cwnd={} ssthresh={}", self.cwnd, self.ssthresh);
-                }
-            }
-            CongestionState::CongestionAvoidance => {
-                // Additive increase: +1 segment per RTT.
-                // Accumulate fractional increments; raise cwnd when the
-                // accumulator reaches the current cwnd.
-                self.cwnd_ca_counter += acked_count;
-                if self.cwnd_ca_counter >= self.cwnd {
-                    self.cwnd_ca_counter = 0;
-                    self.cwnd = (self.cwnd + 1).min(self.window_size);
-                    log::debug!("[cc] CA cwnd={}", self.cwnd);
-                }
-            }
-            CongestionState::FastRecovery => {
-                // A new (non-duplicate) ACK exits fast recovery.
-                self.cwnd = self.ssthresh;
-                self.cc_state = CongestionState::CongestionAvoidance;
-                self.cwnd_ca_counter = 0;
-                log::debug!("[cc] FR→CA cwnd=ssthresh={}", self.cwnd);
-            }
-        }
+        self.cc.on_ack(acked_count);
     }
 
-    /// Handle a retransmit timeout: halve `ssthresh`, reset `cwnd` to 1,
-    /// and re-enter Slow Start (RFC 5681 §3.1).
+    /// Handle a retransmit timeout: delegate to the CC algorithm and reset
+    /// the duplicate-ACK counter (RFC 5681 §3.1).
     ///
     /// Call this **after** retransmitting the window and calling
     /// [`on_retransmit`] so that `in_flight()` still reflects the correct
@@ -475,37 +442,21 @@ impl GbnSender {
     /// [`on_retransmit`]: Self::on_retransmit
     pub fn on_timeout_cc(&mut self) {
         let in_flight = self.window.len();
-        self.ssthresh = (in_flight / 2).max(2);
-        self.cwnd = 1;
+        self.cc.on_loss(in_flight, LossKind::Timeout);
         self.dup_ack_count = 0;
-        self.cwnd_ca_counter = 0;
-        self.cc_state = CongestionState::SlowStart;
-        log::debug!(
-            "[cc] timeout → SS  ssthresh={}  cwnd=1  in_flight={}",
-            self.ssthresh, in_flight
-        );
     }
 
     /// Handle three duplicate ACKs: enter Fast Recovery (Reno fast retransmit).
     ///
-    /// Sets `ssthresh ← max(2, in_flight / 2)` and inflates `cwnd` by 3
-    /// (the three segments that triggered the dup-ACKs are assumed to have
-    /// left the network).  The caller is responsible for retransmitting the
-    /// oldest unacked segment immediately after.
+    /// Delegates to the CC algorithm with [`LossKind::TripleDupAck`].  The
+    /// caller is responsible for retransmitting the oldest unacked segment
+    /// immediately after.
     ///
     /// # Note
     /// Only call when [`dup_ack_count`] has just reached 3.
-    ///
-    /// [`dup_ack_count`]: Self::dup_ack_count
     pub fn on_triple_dup_ack_cc(&mut self) {
         let in_flight = self.window.len();
-        self.ssthresh = (in_flight / 2).max(2);
-        self.cwnd = self.ssthresh + 3; // Reno inflation
-        self.cc_state = CongestionState::FastRecovery;
-        log::debug!(
-            "[cc] 3-dup-ACK → FR  ssthresh={}  cwnd={}  in_flight={}",
-            self.ssthresh, self.cwnd, in_flight
-        );
+        self.cc.on_loss(in_flight, LossKind::TripleDupAck);
     }
 
     // -----------------------------------------------------------------------
@@ -597,18 +548,12 @@ impl GbnSender {
     // -----------------------------------------------------------------------
 
     /// Current congestion window in segments.
+    ///
+    /// Delegates to the underlying [`CongestionControl`] implementation.
+    /// Algorithm-specific state (e.g. `ssthresh`, `cc_state` for Reno) is
+    /// accessible directly via `sender.cc.ssthresh` / `sender.cc.cc_state`.
     pub fn cwnd(&self) -> usize {
-        self.cwnd
-    }
-
-    /// Current slow-start threshold in segments.
-    pub fn ssthresh(&self) -> usize {
-        self.ssthresh
-    }
-
-    /// Current Reno phase.
-    pub fn cc_state(&self) -> &CongestionState {
-        &self.cc_state
+        self.cc.cwnd()
     }
 
     /// Number of consecutive duplicate ACKs seen since the last new ACK.
@@ -739,8 +684,8 @@ mod tests {
         assert!(!s.has_unacked());
         assert_eq!(s.in_flight(), 0);
         assert_eq!(s.cwnd(), INITIAL_CWND);
-        assert_eq!(s.ssthresh(), INITIAL_SSTHRESH);
-        assert_eq!(*s.cc_state(), CongestionState::SlowStart);
+        assert_eq!(s.cc.ssthresh, INITIAL_SSTHRESH);
+        assert_eq!(s.cc.cc_state, CongestionState::SlowStart);
     }
 
     #[test]
@@ -758,7 +703,7 @@ mod tests {
     #[test]
     fn window_full_blocks_send() {
         let mut s = GbnSender::new(0, 2);
-        s.cwnd = 2; // open cwnd so window_size is the binding constraint
+        s.cc.cwnd = 2; // open cwnd so window_size is the binding constraint
         let p1 = make_pkt(0, 5);
         let p2 = make_pkt(5, 5);
         s.record_sent(p1);
@@ -785,7 +730,7 @@ mod tests {
     #[test]
     fn cumulative_ack_slides_multiple() {
         let mut s = GbnSender::new(0, 4);
-        s.cwnd = 4; // bypass cwnd so window_size governs
+        s.cc.cwnd = 4; // bypass cwnd so window_size governs
         for _ in 0..3 {
             let pkt = s.build_data_packet(vec![0u8; 5], 0, 8192);
             s.record_sent(pkt);
@@ -826,7 +771,7 @@ mod tests {
     #[test]
     fn partial_cumulative_ack() {
         let mut s = GbnSender::new(0, 4);
-        s.cwnd = 4;
+        s.cc.cwnd = 4;
         for _ in 0..3 {
             let pkt = s.build_data_packet(vec![0u8; 5], 0, 8192);
             s.record_sent(pkt);
@@ -907,7 +852,7 @@ mod tests {
         // With 3 segments in the window, a cumulative ACK for all three
         // should yield the sample from segment 0 only (the oldest).
         let mut s = GbnSender::new(0, 4);
-        s.cwnd = 4;
+        s.cc.cwnd = 4;
         for _ in 0..3 {
             let pkt = s.build_data_packet(vec![0u8; 4], 0, 8192);
             s.record_sent(pkt);
@@ -930,7 +875,7 @@ mod tests {
         // Even when later segments are clean, if the OLDEST was retransmitted
         // the sample must be None.
         let mut s = GbnSender::new(0, 4);
-        s.cwnd = 4;
+        s.cc.cwnd = 4;
         for _ in 0..3 {
             let pkt = s.build_data_packet(vec![0u8; 4], 0, 8192);
             s.record_sent(pkt);
@@ -972,7 +917,7 @@ mod tests {
     fn slow_start_doubles_cwnd_per_rtt() {
         // With ssthresh=32, slow start should grow cwnd exponentially.
         let mut s = GbnSender::new(0, 32);
-        s.ssthresh = 32; // keep SS going
+        s.cc.ssthresh = 32; // keep SS going
         assert_eq!(s.cwnd(), 1);
 
         // RTT 1: 1 segment in flight, gets ACKed → cwnd = 2
@@ -997,26 +942,26 @@ mod tests {
     #[test]
     fn slow_start_transitions_to_ca_at_ssthresh() {
         let mut s = GbnSender::new(0, 32);
-        s.ssthresh = 4;
-        assert_eq!(*s.cc_state(), CongestionState::SlowStart);
+        s.cc.ssthresh = 4;
+        assert_eq!(s.cc.cc_state, CongestionState::SlowStart);
 
         // 4 ACKs at cwnd=1 → cwnd = 1+4 = 5 ≥ ssthresh → transition to CA.
         // cwnd is allowed to overshoot ssthresh during the slow-start step.
         s.on_ack_cc(4);
-        assert_eq!(*s.cc_state(), CongestionState::CongestionAvoidance);
+        assert_eq!(s.cc.cc_state, CongestionState::CongestionAvoidance);
         assert!(
-            s.cwnd() >= s.ssthresh(),
+            s.cwnd() >= s.cc.ssthresh,
             "cwnd ({}) must be ≥ ssthresh ({}) after SS→CA transition",
-            s.cwnd(), s.ssthresh()
+            s.cwnd(), s.cc.ssthresh
         );
     }
 
     #[test]
     fn congestion_avoidance_grows_by_one_per_rtt() {
         let mut s = GbnSender::new(0, 32);
-        s.ssthresh = 4;
-        s.cwnd = 4;
-        s.cc_state = CongestionState::CongestionAvoidance;
+        s.cc.ssthresh = 4;
+        s.cc.cwnd = 4;
+        s.cc.cc_state = CongestionState::CongestionAvoidance;
 
         // First "RTT": 4 ACKs come in (one per in-flight segment).
         s.on_ack_cc(4);
@@ -1030,9 +975,9 @@ mod tests {
     #[test]
     fn timeout_halves_ssthresh_and_resets_cwnd() {
         let mut s = GbnSender::new(0, 32);
-        s.cwnd = 8;
-        s.ssthresh = 16;
-        s.cc_state = CongestionState::CongestionAvoidance;
+        s.cc.cwnd = 8;
+        s.cc.ssthresh = 16;
+        s.cc.cc_state = CongestionState::CongestionAvoidance;
 
         // Put 6 segments in flight (manually, to avoid cwnd restriction).
         for i in 0..6u32 {
@@ -1046,9 +991,9 @@ mod tests {
 
         s.on_timeout_cc();
 
-        assert_eq!(s.ssthresh(), 3, "ssthresh = max(2, 6/2) = 3");
+        assert_eq!(s.cc.ssthresh, 3, "ssthresh = max(2, 6/2) = 3");
         assert_eq!(s.cwnd(), 1, "cwnd resets to 1 on timeout");
-        assert_eq!(*s.cc_state(), CongestionState::SlowStart);
+        assert_eq!(s.cc.cc_state, CongestionState::SlowStart);
     }
 
     #[test]
@@ -1062,7 +1007,7 @@ mod tests {
         });
 
         s.on_timeout_cc();
-        assert_eq!(s.ssthresh(), 2, "ssthresh floor is 2 even when in_flight/2 < 2");
+        assert_eq!(s.cc.ssthresh, 2, "ssthresh floor is 2 even when in_flight/2 < 2");
         assert_eq!(s.cwnd(), 1);
     }
 
@@ -1089,23 +1034,23 @@ mod tests {
         s.on_triple_dup_ack_cc();
 
         // ssthresh = max(2, 4/2) = 2; cwnd = ssthresh + 3 = 5.
-        assert_eq!(s.ssthresh(), 2);
+        assert_eq!(s.cc.ssthresh, 2);
         assert_eq!(s.cwnd(), 5);
-        assert_eq!(*s.cc_state(), CongestionState::FastRecovery);
+        assert_eq!(s.cc.cc_state, CongestionState::FastRecovery);
     }
 
     #[test]
     fn fast_recovery_exits_on_new_ack() {
         let mut s = GbnSender::new(0, 16);
-        s.ssthresh = 4;
-        s.cwnd = 7; // ssthresh + 3
-        s.cc_state = CongestionState::FastRecovery;
+        s.cc.ssthresh = 4;
+        s.cc.cwnd = 7; // ssthresh + 3
+        s.cc.cc_state = CongestionState::FastRecovery;
 
         // New ACK arrives: exit fast recovery, cwnd = ssthresh.
         s.on_ack_cc(1);
 
         assert_eq!(s.cwnd(), 4, "exit FR: cwnd ← ssthresh");
-        assert_eq!(*s.cc_state(), CongestionState::CongestionAvoidance);
+        assert_eq!(s.cc.cc_state, CongestionState::CongestionAvoidance);
     }
 
     // ── Nagle's algorithm ───────────────────────────────────────────────────

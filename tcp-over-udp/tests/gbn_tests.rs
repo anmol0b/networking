@@ -321,7 +321,7 @@ fn test_gbn_sender_window_boundary() {
     use tcp_over_udp::gbn_sender::GbnSender;
 
     let mut s = GbnSender::new(0, 3);
-    s.cwnd = 3; // bypass congestion window so window_size governs
+    s.cc.cwnd = 3; // bypass congestion window so window_size governs
 
     // Fill the window.
     for _ in 0..3u32 {
@@ -492,7 +492,7 @@ fn test_karn_retransmit_no_sample() {
     use tcp_over_udp::gbn_sender::GbnSender;
 
     let mut s = GbnSender::new(0, 2);
-    s.cwnd = 2; // bypass congestion window so both segments can be sent
+    s.cc.cwnd = 2; // bypass congestion window so both segments can be sent
 
     // Send two segments.
     let p1 = s.build_data_packet(vec![1u8; 8], 0, 8192);
@@ -566,9 +566,9 @@ fn test_cwnd_slow_start_doubles() {
 
     let mut s = GbnSender::new(0, 32);
     // Keep ssthresh high so slow start continues well past our test range.
-    assert_eq!(s.ssthresh(), INITIAL_SSTHRESH);
+    assert_eq!(s.cc.ssthresh, INITIAL_SSTHRESH);
     assert_eq!(s.cwnd(), 1);
-    assert_eq!(*s.cc_state(), CongestionState::SlowStart);
+    assert_eq!(s.cc.cc_state, CongestionState::SlowStart);
 
     // RTT 1: cwnd=1 → send 1 segment, ACK it → cwnd = 2.
     let p = s.build_data_packet(vec![0u8; 4], 0, 8192);
@@ -576,7 +576,7 @@ fn test_cwnd_slow_start_doubles() {
     let r = s.on_ack(4);
     s.on_ack_cc(r.acked_count);
     assert_eq!(s.cwnd(), 2, "SS: cwnd should be 2 after first RTT");
-    assert_eq!(*s.cc_state(), CongestionState::SlowStart);
+    assert_eq!(s.cc.cc_state, CongestionState::SlowStart);
 
     // RTT 2: cwnd=2 → send 2 segments, ACK both → cwnd = 4.
     for _ in 0..2 {
@@ -586,7 +586,7 @@ fn test_cwnd_slow_start_doubles() {
     let r = s.on_ack(s.next_seq);
     s.on_ack_cc(r.acked_count);
     assert_eq!(s.cwnd(), 4, "SS: cwnd should be 4 after second RTT");
-    assert_eq!(*s.cc_state(), CongestionState::SlowStart);
+    assert_eq!(s.cc.cc_state, CongestionState::SlowStart);
 }
 
 // ---------------------------------------------------------------------------
@@ -599,9 +599,9 @@ fn test_cwnd_congestion_avoidance_linear() {
 
     let mut s = GbnSender::new(0, 32);
     // Manually place sender in CA phase at cwnd=4 via public fields.
-    s.ssthresh = 4;
-    s.cwnd = 4;
-    s.cc_state = CongestionState::CongestionAvoidance;
+    s.cc.ssthresh = 4;
+    s.cc.cwnd = 4;
+    s.cc.cc_state = CongestionState::CongestionAvoidance;
 
     // First "RTT": 4 ACKs arrive (one per in-flight segment) → cwnd = 5.
     s.on_ack_cc(4);
@@ -611,7 +611,7 @@ fn test_cwnd_congestion_avoidance_linear() {
     s.on_ack_cc(5);
     assert_eq!(s.cwnd(), 6, "CA: linear growth +1 per RTT");
 
-    assert_eq!(*s.cc_state(), CongestionState::CongestionAvoidance);
+    assert_eq!(s.cc.cc_state, CongestionState::CongestionAvoidance);
 }
 
 // ---------------------------------------------------------------------------
@@ -624,9 +624,9 @@ fn test_cwnd_timeout_halves_and_resets() {
 
     // Start in CA with a large cwnd so we can fill 6 segments.
     let mut s = GbnSender::new(0, 32);
-    s.cwnd = 8;
-    s.ssthresh = 16;
-    s.cc_state = CongestionState::CongestionAvoidance;
+    s.cc.cwnd = 8;
+    s.cc.ssthresh = 16;
+    s.cc.cc_state = CongestionState::CongestionAvoidance;
 
     // Use record_sent() to put 6 segments in flight (cwnd=8, so this fits).
     for _ in 0..6 {
@@ -638,9 +638,9 @@ fn test_cwnd_timeout_halves_and_resets() {
     // Simulate a timeout (packet loss detected via RTO expiry).
     s.on_timeout_cc();
 
-    assert_eq!(s.ssthresh(), 3, "ssthresh = max(2, 6/2) = 3");
+    assert_eq!(s.cc.ssthresh, 3, "ssthresh = max(2, 6/2) = 3");
     assert_eq!(s.cwnd(), 1, "cwnd resets to 1 on timeout");
-    assert_eq!(*s.cc_state(), CongestionState::SlowStart, "must re-enter SlowStart");
+    assert_eq!(s.cc.cc_state, CongestionState::SlowStart, "must re-enter SlowStart");
 }
 
 // ---------------------------------------------------------------------------
@@ -653,7 +653,7 @@ fn test_cwnd_triple_dup_ack_enters_fast_recovery() {
 
     // Window size 8; inflate cwnd to allow 4 in-flight segments.
     let mut s = GbnSender::new(0, 8);
-    s.cwnd = 4;
+    s.cc.cwnd = 4;
 
     for _ in 0..4 {
         let p = s.build_data_packet(vec![0u8; 4], 0, 8192);
@@ -671,9 +671,9 @@ fn test_cwnd_triple_dup_ack_enters_fast_recovery() {
     s.on_triple_dup_ack_cc();
 
     // ssthresh = max(2, 4/2) = 2; cwnd = ssthresh + 3 = 5 (Reno inflation).
-    assert_eq!(s.ssthresh(), 2, "ssthresh = max(2, 4/2) = 2");
+    assert_eq!(s.cc.ssthresh, 2, "ssthresh = max(2, 4/2) = 2");
     assert_eq!(s.cwnd(), 5, "cwnd = ssthresh + 3 = 5 (Reno fast recovery inflation)");
-    assert_eq!(*s.cc_state(), CongestionState::FastRecovery);
+    assert_eq!(s.cc.cc_state, CongestionState::FastRecovery);
 }
 
 // ---------------------------------------------------------------------------
@@ -685,15 +685,15 @@ fn test_cwnd_fast_recovery_exit_on_new_ack() {
     use tcp_over_udp::gbn_sender::{CongestionState, GbnSender};
 
     let mut s = GbnSender::new(0, 16);
-    s.ssthresh = 4;
-    s.cwnd = 7; // ssthresh + 3 (Reno fast recovery inflation)
-    s.cc_state = CongestionState::FastRecovery;
+    s.cc.ssthresh = 4;
+    s.cc.cwnd = 7; // ssthresh + 3 (Reno fast recovery inflation)
+    s.cc.cc_state = CongestionState::FastRecovery;
 
     // A genuine new ACK arrives → exit fast recovery, cwnd ← ssthresh.
     s.on_ack_cc(1);
 
     assert_eq!(s.cwnd(), 4, "exit FR: cwnd ← ssthresh = 4");
-    assert_eq!(*s.cc_state(), CongestionState::CongestionAvoidance);
+    assert_eq!(s.cc.cc_state, CongestionState::CongestionAvoidance);
 }
 
 // ---------------------------------------------------------------------------
@@ -705,7 +705,7 @@ fn test_reordered_ack_below_threshold_no_fast_retransmit() {
     use tcp_over_udp::gbn_sender::{CongestionState, GbnSender};
 
     let mut s = GbnSender::new(0, 8);
-    s.cwnd = 4;
+    s.cc.cwnd = 4;
 
     // Put 4 segments in flight (4-byte payloads → seq 0, 4, 8, 12).
     for _ in 0..4 {
@@ -721,7 +721,7 @@ fn test_reordered_ack_below_threshold_no_fast_retransmit() {
     assert!(r2.dup_ack, "second dup-ACK must be flagged");
     assert_eq!(s.dup_ack_count(), 2);
     assert_ne!(
-        *s.cc_state(),
+        s.cc.cc_state,
         CongestionState::FastRecovery,
         "2 dup-ACKs must not enter fast recovery (reordering threshold is 3)"
     );
@@ -731,7 +731,7 @@ fn test_reordered_ack_below_threshold_no_fast_retransmit() {
     assert_eq!(r3.acked_count, 2, "new ACK must ack 2 segments");
     assert_eq!(s.dup_ack_count(), 0, "new ACK must reset dup_ack_count");
     assert_ne!(
-        *s.cc_state(),
+        s.cc.cc_state,
         CongestionState::FastRecovery,
         "cwnd must not enter fast recovery once reordering resolves"
     );
@@ -747,7 +747,7 @@ fn test_fast_retransmit_cwnd_above_one_unlike_timeout() {
 
     // ── Fast retransmit path ──────────────────────────────────────────────
     let mut s_fr = GbnSender::new(0, 8);
-    s_fr.cwnd = 4;
+    s_fr.cc.cwnd = 4;
     for _ in 0..4 {
         let p = s_fr.build_data_packet(vec![0u8; 4], 0, 8192);
         s_fr.record_sent(p);
@@ -757,7 +757,7 @@ fn test_fast_retransmit_cwnd_above_one_unlike_timeout() {
     }
     s_fr.on_triple_dup_ack_cc();
 
-    assert_eq!(*s_fr.cc_state(), CongestionState::FastRecovery);
+    assert_eq!(s_fr.cc.cc_state, CongestionState::FastRecovery);
     assert_ne!(
         s_fr.cwnd(), 1,
         "fast retransmit must NOT collapse cwnd to 1 — only a timeout does that"
@@ -766,7 +766,7 @@ fn test_fast_retransmit_cwnd_above_one_unlike_timeout() {
 
     // ── Timeout path — same initial conditions ────────────────────────────
     let mut s_to = GbnSender::new(0, 8);
-    s_to.cwnd = 4;
+    s_to.cc.cwnd = 4;
     for _ in 0..4 {
         let p = s_to.build_data_packet(vec![0u8; 4], 0, 8192);
         s_to.record_sent(p);
@@ -774,7 +774,7 @@ fn test_fast_retransmit_cwnd_above_one_unlike_timeout() {
     s_to.on_timeout_cc();
 
     assert_eq!(s_to.cwnd(), 1, "timeout must reset cwnd to 1");
-    assert_eq!(*s_to.cc_state(), CongestionState::SlowStart);
+    assert_eq!(s_to.cc.cc_state, CongestionState::SlowStart);
 
     assert!(
         fr_cwnd > s_to.cwnd(),
@@ -791,7 +791,7 @@ fn test_fast_recovery_full_cycle_via_on_ack() {
     use tcp_over_udp::gbn_sender::{CongestionState, GbnSender};
 
     let mut s = GbnSender::new(0, 16);
-    s.cwnd = 4;
+    s.cc.cwnd = 4;
 
     // 4 segments in flight (seq 0, 4, 8, 12).
     for _ in 0..4 {
@@ -811,16 +811,16 @@ fn test_fast_recovery_full_cycle_via_on_ack() {
 
     // Enter fast recovery on the 3rd dup-ACK.
     s.on_triple_dup_ack_cc();
-    let fr_ssthresh = s.ssthresh();
+    let fr_ssthresh = s.cc.ssthresh;
     assert_eq!(fr_ssthresh, 2, "ssthresh = max(2, 4/2) = 2");
     assert_eq!(s.cwnd(), fr_ssthresh + 3, "cwnd = ssthresh + 3 in fast recovery");
-    assert_eq!(*s.cc_state(), CongestionState::FastRecovery);
+    assert_eq!(s.cc.cc_state, CongestionState::FastRecovery);
 
     // A new (non-duplicate) ACK exits fast recovery → congestion avoidance.
     s.on_ack_cc(1);
     assert_eq!(s.cwnd(), fr_ssthresh, "FR→CA: cwnd must collapse to ssthresh");
     assert_eq!(
-        *s.cc_state(),
+        s.cc.cc_state,
         CongestionState::CongestionAvoidance,
         "must enter congestion avoidance after fast recovery exit"
     );
@@ -948,7 +948,7 @@ fn test_sender_pauses_on_zero_peer_rwnd() {
     use tcp_over_udp::gbn_sender::GbnSender;
 
     let mut s = GbnSender::new(0, 8);
-    s.cwnd = 4; // cwnd is permissive; rwnd should be the binding constraint
+    s.cc.cwnd = 4; // cwnd is permissive; rwnd should be the binding constraint
 
     // No in-flight segments; peer_rwnd = 0 → cannot send.
     s.update_peer_rwnd(0);
@@ -968,7 +968,7 @@ fn test_bytes_in_flight_tracks_payload_size() {
     use tcp_over_udp::gbn_sender::GbnSender;
 
     let mut s = GbnSender::new(0, 8);
-    s.cwnd = 4;
+    s.cc.cwnd = 4;
     s.update_peer_rwnd(200);
 
     // Send 3 × 20-byte segments.
@@ -1139,7 +1139,7 @@ fn test_sr_selective_retransmit_oldest_only() {
     use tcp_over_udp::gbn_sender::GbnSender;
 
     let mut s = GbnSender::new(0, 4);
-    s.cwnd = 3; // allow 3 in-flight
+    s.cc.cwnd = 3; // allow 3 in-flight
 
     // 3 segments of 8 bytes each (seq 0, 8, 16).
     for _ in 0..3 {
@@ -1170,7 +1170,7 @@ fn test_sr_full_cycle() {
 
     // Sender: window=4, cwnd=4.
     let mut sender = GbnSender::new(0, 4);
-    sender.cwnd = 4;
+    sender.cc.cwnd = 4;
 
     // Receiver: large buffer, expecting seq=0.
     let mut receiver = GbnReceiver::new(0);

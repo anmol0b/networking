@@ -57,6 +57,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+use crate::congestion_control::{CongestionControl, RenoCC};
 use crate::connection::{ConnError, Connection};
 use crate::gbn_receiver::GbnReceiver;
 use crate::gbn_sender::{AckResult, GbnSender};
@@ -91,12 +92,19 @@ const FIN_WAIT_2_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A reliable connection using Go-Back-N sliding-window flow control with
 /// adaptive retransmission timeout.
-pub struct GbnConnection {
+///
+/// The congestion-control algorithm is a type parameter with a default of
+/// [`RenoCC`] (TCP Reno).  Existing callers need no changes; callers that
+/// want a different algorithm can use turbofish:
+/// ```ignore
+/// GbnConnection::<CubicCC>::connect(socket, peer, 4).await?
+/// ```
+pub struct GbnConnection<CC: CongestionControl = RenoCC> {
     /// Current FSM state.
     pub state: ConnectionState,
 
     /// Outbound GBN window (sequence numbers, in-flight queue).
-    pub sender: GbnSender,
+    pub sender: GbnSender<CC>,
 
     /// Inbound state (cumulative ACKs, application buffer).
     pub receiver: GbnReceiver,
@@ -129,11 +137,9 @@ pub struct GbnConnection {
     mss: u16,
 }
 
+// Constructors use GbnSender::new() which is only available for RenoCC.
+// All other methods are generic over any CongestionControl.
 impl GbnConnection {
-    // -----------------------------------------------------------------------
-    // Constructors
-    // -----------------------------------------------------------------------
-
     /// Build a [`GbnConnection`] from an already-established [`Connection`].
     ///
     /// The 3-way handshake must be complete.  `window_size` sets the GBN
@@ -170,15 +176,6 @@ impl GbnConnection {
             msl: DEFAULT_MSL,
             mss: negotiated_mss,
         }
-    }
-
-    /// The Maximum Segment Size negotiated during the 3-way handshake.
-    ///
-    /// Data passed to [`send`] is split into chunks of at most this many bytes.
-    ///
-    /// [`send`]: Self::send
-    pub fn mss(&self) -> u16 {
-        self.mss
     }
 
     /// Active open (client): run the 3-way handshake then return a GBN connection.
@@ -224,6 +221,17 @@ impl GbnConnection {
     ) -> Result<Self, ConnError> {
         let conn = Connection::accept(socket).await?;
         Ok(Self::from_connection_with_recv_buf(conn, window_size, recv_buf_bytes))
+    }
+}
+
+impl<CC: CongestionControl> GbnConnection<CC> {
+    /// The Maximum Segment Size negotiated during the 3-way handshake.
+    ///
+    /// Data passed to [`send`] is split into chunks of at most this many bytes.
+    ///
+    /// [`send`]: Self::send
+    pub fn mss(&self) -> u16 {
+        self.mss
     }
 
     /// Override the Maximum Segment Lifetime used for `TIME_WAIT`.
@@ -366,8 +374,8 @@ impl GbnConnection {
                         self.rtt.back_off();
                         rto = self.rtt.rto();
                         log::debug!(
-                            "[gbn] SR timeout #{} — rto={:?} cwnd={} ssthresh={}",
-                            retries, rto, self.sender.cwnd(), self.sender.ssthresh()
+                            "[gbn] SR timeout #{} — rto={:?} cwnd={}",
+                            retries, rto, self.sender.cwnd()
                         );
                     }
                 }
@@ -540,8 +548,8 @@ impl GbnConnection {
                         self.rtt.back_off();
                         rto = self.rtt.rto();
                         log::debug!(
-                            "[gbn] SR flush timeout #{} — rto={:?} cwnd={} ssthresh={}",
-                            retries, rto, self.sender.cwnd(), self.sender.ssthresh()
+                            "[gbn] SR flush timeout #{} — rto={:?} cwnd={}",
+                            retries, rto, self.sender.cwnd()
                         );
                     }
                 }
@@ -742,11 +750,9 @@ impl GbnConnection {
         if acked_count > 0 {
             self.sender.on_ack_cc(acked_count);
             log::debug!(
-                "[gbn] cwnd={} ssthresh={} peer_rwnd={} state={:?}",
+                "[gbn] cwnd={} peer_rwnd={}",
                 self.sender.cwnd(),
-                self.sender.ssthresh(),
-                self.sender.peer_rwnd(),
-                self.sender.cc_state()
+                self.sender.peer_rwnd()
             );
         }
         acked_count
@@ -1072,10 +1078,10 @@ impl GbnSession {
 // Background event loop (concurrent mode)
 // ---------------------------------------------------------------------------
 
-async fn event_loop(
+async fn event_loop<CC: CongestionControl>(
     socket: Arc<Socket>,
     peer: SocketAddr,
-    mut sender: GbnSender,
+    mut sender: GbnSender<CC>,
     mut receiver: GbnReceiver,
     mut rtt: RttEstimator,
     mut app_rx: mpsc::Receiver<Vec<u8>>,
@@ -1350,8 +1356,8 @@ async fn event_loop(
                         retries = 0;
                         rto = rtt.rto();
                         log::debug!(
-                            "[gbn:loop] ← ACK ack={} slid={} rto={:?} cwnd={} ssthresh={} peer_rwnd={}",
-                            h.ack, acked_count, rto, sender.cwnd(), sender.ssthresh(), sender.peer_rwnd()
+                            "[gbn:loop] ← ACK ack={} slid={} rto={:?} cwnd={} peer_rwnd={}",
+                            h.ack, acked_count, rto, sender.cwnd(), sender.peer_rwnd()
                         );
 
                         // Update retransmit timer state (persist transition already handled above).
@@ -1383,8 +1389,8 @@ async fn event_loop(
                             e.tx_count += 1;
                         }
                         log::debug!(
-                            "[gbn:loop] 3-dup-ACK → FR cwnd={} ssthresh={}",
-                            sender.cwnd(), sender.ssthresh()
+                            "[gbn:loop] 3-dup-ACK → FR cwnd={}",
+                            sender.cwnd()
                         );
                     }
                 }
@@ -1425,8 +1431,8 @@ async fn event_loop(
                 rto = rtt.rto();
                 retransmit_tmr.as_mut().reset(tok_now() + rto);
                 log::debug!(
-                    "[gbn:loop] SR timeout #{} rto={:?} cwnd={} ssthresh={}",
-                    retries, rto, sender.cwnd(), sender.ssthresh()
+                    "[gbn:loop] SR timeout #{} rto={:?} cwnd={}",
+                    retries, rto, sender.cwnd()
                 );
             }
 
@@ -1502,7 +1508,7 @@ async fn run_time_wait(
 // Packet builders
 // ---------------------------------------------------------------------------
 
-fn build_ack(sender: &GbnSender, receiver: &GbnReceiver) -> Packet {
+fn build_ack<CC: CongestionControl>(sender: &GbnSender<CC>, receiver: &GbnReceiver) -> Packet {
     Packet {
         header: Header {
             seq: sender.next_seq,
@@ -1516,7 +1522,7 @@ fn build_ack(sender: &GbnSender, receiver: &GbnReceiver) -> Packet {
     }
 }
 
-fn build_fin(sender: &GbnSender, receiver: &GbnReceiver) -> Packet {
+fn build_fin<CC: CongestionControl>(sender: &GbnSender<CC>, receiver: &GbnReceiver) -> Packet {
     Packet {
         header: Header {
             seq: sender.next_seq,

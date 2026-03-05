@@ -34,6 +34,7 @@
 //! - [`simulator`]       — optional lossy/reorder network layer for testing
 //! - [`socket`]          — async UDP socket abstraction
 
+pub mod congestion_control;
 pub mod connection;
 pub mod gbn_connection;
 pub mod gbn_receiver;
