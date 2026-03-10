@@ -177,8 +177,12 @@ async fn test_gbn_concurrent_session() {
             .expect("accept");
         loop {
             match conn.recv().await {
-                Ok(data) => conn.send(&data).await.expect("echo"),
-                Err(ConnError::Eof) => break,
+                Ok(data) => {
+                    conn.send(&data).await.expect("echo");
+                }
+                Err(ConnError::Eof) => {
+                    break;
+                }
                 Err(e) => panic!("server: {e}"),
             }
         }
@@ -194,35 +198,59 @@ async fn test_gbn_concurrent_session() {
 
         let mut session = conn.run();
 
+        // Build expected total payload for verification.
+        let mut expected_total = Vec::new();
+        for i in 0..MSG_COUNT {
+            expected_total.extend_from_slice(format!("item-{i}").as_bytes());
+        }
+
         // Send all messages through the channel (non-blocking).
         for i in 0..MSG_COUNT {
             let msg = format!("item-{i}");
             session.send(msg.into_bytes()).await.expect("session send");
         }
 
-        // Collect echoes.
-        let mut replies = Vec::new();
-        for _ in 0..MSG_COUNT {
+        // Collect echoes.  TCP is a byte stream, so the server's synchronous
+        // send_segment may coalesce incoming data while blocked on window space.
+        // We therefore collect all received bytes rather than expecting exactly
+        // MSG_COUNT separate messages.
+        let mut received_total = Vec::new();
+        loop {
             match session.recv().await {
-                Ok(data) => replies.push(data),
+                Ok(data) => {
+                    received_total.extend_from_slice(&data);
+                    // Stop once we have all expected bytes.
+                    if received_total.len() >= expected_total.len() {
+                        break;
+                    }
+                }
                 Err(ConnError::Eof) => break,
                 Err(e) => panic!("client session recv: {e}"),
             }
         }
 
         session.close().await;
-        replies
+        (received_total, expected_total)
     });
 
     let (sr, cr) = tokio::join!(server, client);
     sr.unwrap();
-    let replies = cr.unwrap();
+    let (received_total, expected_total) = cr.unwrap();
 
-    assert_eq!(replies.len(), MSG_COUNT);
-    for (i, r) in replies.iter().enumerate() {
-        let expected = format!("item-{i}");
-        assert_eq!(r, expected.as_bytes());
-    }
+    // Verify total bytes match (TCP byte-stream semantics).
+    assert_eq!(
+        received_total.len(),
+        expected_total.len(),
+        "total bytes mismatch: got {}, expected {}",
+        received_total.len(),
+        expected_total.len()
+    );
+    assert_eq!(
+        received_total, expected_total,
+        "byte content mismatch:\n  received: {:?}\n  expected: {:?}",
+        String::from_utf8_lossy(&received_total),
+        String::from_utf8_lossy(&expected_total)
+    );
 }
 
 // ---------------------------------------------------------------------------
